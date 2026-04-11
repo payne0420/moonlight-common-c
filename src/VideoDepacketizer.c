@@ -70,7 +70,14 @@ typedef struct _LENTRY_INTERNAL {
 void initializeVideoDepacketizer(int streamIndex, int pktSize) {
     VIDEO_DEPACKETIZER_CTX* ctx = &depacketizers[streamIndex];
 
-    LbqInitializeLinkedBlockingQueue(&ctx->decodeUnitQueue, 15);
+    // Only initialize the decode unit queue for stream 0. All streams push to
+    // depacketizers[0].decodeUnitQueue, so the queue (and its mutex/condvar)
+    // should only be created and destroyed once. Without this guard, streams 1+
+    // create queues that are never destroyed, leaking mutexes and triggering
+    // the LC_ASSERT(activeMutexes == 0) assertion in cleanupPlatform().
+    if (streamIndex == 0) {
+        LbqInitializeLinkedBlockingQueue(&ctx->decodeUnitQueue, 15);
+    }
 
     ctx->nextFrameNumber = 1;
     ctx->startFrameNumber = 0;
