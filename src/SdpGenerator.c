@@ -311,6 +311,12 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
         snprintf(payloadStr, sizeof(payloadStr), "%u", EncryptionFeaturesEnabled);
         err |= addAttributeString(&optionHead, "x-ss-general.encryptionEnabled", payloadStr);
 
+        // Multi-stream video: tell the server how many video streams we want
+        if (NumVideoStreams > 1) {
+            snprintf(payloadStr, sizeof(payloadStr), "%d", NumVideoStreams);
+            err |= addAttributeString(&optionHead, "x-ss-video.numStreams", payloadStr);
+        }
+
         // Enable YUV444 if requested
         if (NegotiatedVideoFormat & VIDEO_FORMAT_MASK_YUV444) {
             err |= addAttributeString(&optionHead, "x-ss-video[0].chromaSamplingType", "1");

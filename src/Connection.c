@@ -28,9 +28,10 @@ bool ReferenceFrameInvalidationSupported;
 uint16_t RtspPortNumber;
 uint16_t ControlPortNumber;
 uint16_t AudioPortNumber;
-uint16_t VideoPortNumber;
+int NumVideoStreams;
+uint16_t VideoPortNumbers[MAX_VIDEO_STREAMS];
+SS_PING VideoPingPayloads[MAX_VIDEO_STREAMS];
 SS_PING AudioPingPayload;
-SS_PING VideoPingPayload;
 uint32_t ControlConnectData;
 uint32_t SunshineFeatureFlags;
 uint32_t EncryptionFeaturesSupported;
@@ -268,7 +269,12 @@ int LiStartConnection(PSERVER_INFORMATION serverInfo, PSTREAM_CONFIGURATION stre
     RemoteAddrString = strdup(serverInfo->address);
 
     // The values in RTSP SETUP will be used to populate these.
-    VideoPortNumber = 0;
+    NumVideoStreams = StreamConfig.multiStreamCount > 0 ? StreamConfig.multiStreamCount : 1;
+    if (NumVideoStreams > MAX_VIDEO_STREAMS) {
+        NumVideoStreams = MAX_VIDEO_STREAMS;
+    }
+    memset(VideoPortNumbers, 0, sizeof(VideoPortNumbers));
+    memset(VideoPingPayloads, 0, sizeof(VideoPingPayloads));
     ControlPortNumber = 0;
     AudioPortNumber = 0;
 

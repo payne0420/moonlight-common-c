@@ -203,6 +203,10 @@ typedef struct _DECODE_UNIT {
     // Note: This is not currently parsed from the actual bitstream, so if your
     // client has access to a bitstream parser, prefer that over this field.
     uint8_t colorspace;
+
+    // Index of the video stream this decode unit belongs to (0 = primary).
+    // Used for multi-monitor streaming where each monitor has its own video stream.
+    int streamIndex;
 } DECODE_UNIT, *PDECODE_UNIT;
 
 // Specifies that the audio stream should be encoded in stereo (default)

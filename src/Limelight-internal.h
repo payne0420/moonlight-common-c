@@ -36,10 +36,18 @@ extern bool ReferenceFrameInvalidationSupported;
 extern uint16_t RtspPortNumber;
 extern uint16_t ControlPortNumber;
 extern uint16_t AudioPortNumber;
-extern uint16_t VideoPortNumber;
+
+// Multi-stream video support: N independent video streams (monitors)
+#define MAX_VIDEO_STREAMS 4
+extern int NumVideoStreams;
+extern uint16_t VideoPortNumbers[MAX_VIDEO_STREAMS];
+extern SS_PING VideoPingPayloads[MAX_VIDEO_STREAMS];
+
+// Backward-compatible aliases for single-stream code paths
+#define VideoPortNumber VideoPortNumbers[0]
+#define VideoPingPayload VideoPingPayloads[0]
 
 extern SS_PING AudioPingPayload;
-extern SS_PING VideoPingPayload;
 extern uint32_t ControlConnectData;
 
 extern uint32_t SunshineFeatureFlags;
