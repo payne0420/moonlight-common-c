@@ -1011,6 +1011,11 @@ bool LiGetHdrMetadata(PSS_HDR_METADATA metadata);
 // frame, just that an IDR frame will arrive soon.
 void LiRequestIdrFrame(void);
 
+// Request an IDR frame for a specific video stream (multi-stream mode).
+// streamIndex 0 is the primary stream; 1..N-1 are additional streams.
+// Falls back to LiRequestIdrFrame() if the host doesn't support per-stream IDR.
+void LiRequestIdrFrameForStream(uint8_t streamIndex);
+
 // This function returns any extended feature flags supported by the host.
 #define LI_FF_PEN_TOUCH_EVENTS        0x01 // LiSendTouchEvent()/LiSendPenEvent() supported
 #define LI_FF_CONTROLLER_TOUCH_EVENTS 0x02 // LiSendControllerTouchEvent() supported

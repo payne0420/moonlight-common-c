@@ -421,6 +421,21 @@ void LiRequestIdrFrame(void) {
     PltSetEvent(&idrFrameRequiredEvent);
 }
 
+// Request an IDR frame for a specific video stream (multi-stream).
+// For stream 0 or non-Sunshine hosts, falls back to global IDR.
+void LiRequestIdrFrameForStream(uint8_t streamIndex) {
+    if (streamIndex == 0 || !IS_SUNSHINE()) {
+        LiRequestIdrFrame();
+        return;
+    }
+
+    // Per-stream IDR: for now, fall back to global IDR.
+    // Full per-stream control message (0x5504) will be added when the
+    // server handler is implemented.
+    Limelog("Per-stream IDR requested for stream %d\n", streamIndex);
+    LiRequestIdrFrame();
+}
+
 // Invalidate reference frames lost by the network
 void connectionDetectedFrameLoss(uint32_t startFrame, uint32_t endFrame) {
     queueFrameInvalidationTuple(startFrame, endFrame);
