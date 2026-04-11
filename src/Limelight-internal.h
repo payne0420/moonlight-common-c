@@ -143,12 +143,12 @@ bool isControlDataInTransit(void);
 
 int performRtspHandshake(PSERVER_INFORMATION serverInfo);
 
-void initializeVideoDepacketizer(int pktSize);
-void destroyVideoDepacketizer(void);
-void queueRtpPacket(PRTPV_QUEUE_ENTRY queueEntry);
-void stopVideoDepacketizer(void);
-void requestDecoderRefresh(void);
-void notifyFrameLost(unsigned int frameNumber, bool speculative);
+void initializeVideoDepacketizer(int streamIndex, int pktSize);
+void destroyVideoDepacketizer(int streamIndex);
+void queueRtpPacket(int streamIndex, PRTPV_QUEUE_ENTRY queueEntry);
+void stopVideoDepacketizer(int streamIndex);
+void requestDecoderRefresh(int streamIndex);
+void notifyFrameLost(int streamIndex, unsigned int frameNumber, bool speculative);
 
 void initializeVideoStream(void);
 void destroyVideoStream(void);

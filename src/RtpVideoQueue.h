@@ -48,6 +48,8 @@ typedef struct _RTP_VIDEO_QUEUE {
     bool receivedOosData;
 
     RTP_VIDEO_STATS stats; // the above values are short-lived, this tracks stats for the life of the queue
+
+    int streamIndex;
 } RTP_VIDEO_QUEUE, *PRTP_VIDEO_QUEUE;
 
 #define RTPF_RET_QUEUED    0

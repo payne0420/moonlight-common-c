@@ -49,8 +49,9 @@ void initializeVideoStream(void) {
     for (int i = 0; i < numActiveVideoStreams; i++) {
         VIDEO_STREAM_STATE* state = &videoStreams[i];
 
-        initializeVideoDepacketizer(StreamConfig.packetSize);
+        initializeVideoDepacketizer(i, StreamConfig.packetSize);
         RtpvInitializeQueue(&state->rtpQueue);
+        state->rtpQueue.streamIndex = i;
         state->decryptionCtx = PltCreateCryptoContext();
         state->receivedDataFromPeer = false;
         state->firstDataTimeMs = 0;
@@ -70,7 +71,9 @@ void destroyVideoStream(void) {
         RtpvCleanupQueue(&state->rtpQueue);
     }
 
-    destroyVideoDepacketizer();
+    for (int i = 0; i < numActiveVideoStreams; i++) {
+        destroyVideoDepacketizer(i);
+    }
 }
 
 // UDP Ping proc -- per-stream
@@ -308,7 +311,9 @@ void stopVideoStream(void) {
     VideoCallbacks.stop();
 
     // Wake up client code that may be waiting on the decode unit queue
-    stopVideoDepacketizer();
+    for (int i = 0; i < numActiveVideoStreams; i++) {
+        stopVideoDepacketizer(i);
+    }
 
     // Interrupt all threads for all streams
     for (int i = 0; i < numActiveVideoStreams; i++) {
