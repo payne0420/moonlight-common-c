@@ -100,6 +100,18 @@ typedef struct _STREAM_CONFIGURATION {
     // in /launch and /resume requests.
     char remoteInputAesKey[16];
     char remoteInputAesIv[16];
+
+    // Multi-stream: number of independent video streams (1 = legacy single-stream).
+    // When > 1, the primary stream (index 0) uses the standard video port,
+    // and additional streams use ports from additionalVideoPorts[].
+    int multiStreamCount;
+
+    // Ports for additional video streams (indices 1..multiStreamCount-1).
+    // Populated during RTSP handshake from server SETUP responses.
+    uint16_t additionalVideoPorts[3];
+
+    // Ping payloads for additional video streams.
+    char additionalVideoPingPayloads[3][16];
 } STREAM_CONFIGURATION, *PSTREAM_CONFIGURATION;
 
 // Use this function to zero the stream configuration when allocated on the stack or heap

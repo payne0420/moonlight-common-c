@@ -1146,6 +1146,19 @@ int performRtspHandshake(PSERVER_INFORMATION serverInfo) {
             SunshineFeatureFlags = 0;
         }
 
+        // Check if the server supports multi-stream (independent per-monitor encoding)
+        {
+            unsigned int multiStreamSupported = 0;
+            if (parseSdpAttributeToUInt(response.payload, "x-ss-general.multiStreamSupported", &multiStreamSupported)) {
+                MultiStreamSupported = (multiStreamSupported != 0);
+                if (MultiStreamSupported) {
+                    Limelog("Server supports multi-stream video encoding\n");
+                }
+            } else {
+                MultiStreamSupported = false;
+            }
+        }
+
         // Look for the Sunshine encryption flags in the SDP attributes
         if (!parseSdpAttributeToUInt(response.payload, "x-ss-general.encryptionSupported", &EncryptionFeaturesSupported)) {
             EncryptionFeaturesSupported = 0;
@@ -1284,6 +1297,68 @@ int performRtspHandshake(PSERVER_INFORMATION serverInfo) {
         }
 
         freeMessage(&response);
+    }
+
+    // Multi-stream: issue additional SETUP requests for video streams 1..N-1
+    MultiStreamCount = 0;
+    memset(AdditionalVideoPortNumbers, 0, sizeof(AdditionalVideoPortNumbers));
+    memset(AdditionalVideoPingPayloads, 0, sizeof(AdditionalVideoPingPayloads));
+    if (MultiStreamSupported && StreamConfig.multiStreamCount > 1) {
+        int i;
+        MultiStreamCount = StreamConfig.multiStreamCount;
+
+        for (i = 1; i < MultiStreamCount && i <= 3; i++) {
+            RTSP_MESSAGE response;
+            int error = -1;
+            char streamIdStr[64];
+            char* pingPayload;
+
+            snprintf(streamIdStr, sizeof(streamIdStr), "streamid=video/%d/0", i);
+
+            if (!setupStream(&response, streamIdStr, &error)) {
+                Limelog("RTSP SETUP %s request failed: %d\n", streamIdStr, error);
+                Limelog("Falling back to single-stream mode\n");
+                MultiStreamCount = 1;
+                break;
+            }
+
+            if (response.message.response.statusCode != 200) {
+                Limelog("RTSP SETUP %s request failed: %d\n", streamIdStr,
+                    response.message.response.statusCode);
+                Limelog("Falling back to single-stream mode\n");
+                MultiStreamCount = 1;
+                freeMessage(&response);
+                break;
+            }
+
+            // Parse the additional video port
+            if (!parseServerPortFromTransport(&response, &AdditionalVideoPortNumbers[i - 1])) {
+                Limelog("Failed to parse port for video stream %d, falling back to single-stream\n", i);
+                MultiStreamCount = 1;
+                freeMessage(&response);
+                break;
+            }
+
+            Limelog("Video stream %d port: %u\n", i, AdditionalVideoPortNumbers[i - 1]);
+
+            // Parse per-stream ping payload
+            pingPayload = getOptionContent(response.options, "X-SS-Ping-Payload");
+            if (pingPayload != NULL && strlen(pingPayload) == sizeof(AdditionalVideoPingPayloads[0].payload)) {
+                memcpy(AdditionalVideoPingPayloads[i - 1].payload, pingPayload,
+                       sizeof(AdditionalVideoPingPayloads[0].payload));
+            }
+
+            freeMessage(&response);
+        }
+
+        if (MultiStreamCount > 1) {
+            Limelog("Multi-stream negotiated: %d independent video streams\n", MultiStreamCount);
+
+            // Copy negotiated ports and payloads back into StreamConfig for the application layer
+            memcpy(StreamConfig.additionalVideoPorts, AdditionalVideoPortNumbers, sizeof(AdditionalVideoPortNumbers));
+            memcpy(StreamConfig.additionalVideoPingPayloads, AdditionalVideoPingPayloads,
+                   sizeof(StreamConfig.additionalVideoPingPayloads));
+        }
     }
 
     if (AppVersionQuad[0] >= 5) {

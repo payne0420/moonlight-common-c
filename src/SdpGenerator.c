@@ -269,8 +269,17 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
     if (IS_SUNSHINE()) {
         // Send client feature flags to Sunshine hosts
         uint32_t moonlightFeatureFlags = ML_FF_FEC_STATUS | ML_FF_SESSION_ID_V1;
+        if (MultiStreamSupported && StreamConfig.multiStreamCount > 1) {
+            moonlightFeatureFlags |= ML_FF_MULTI_STREAM;
+        }
         snprintf(payloadStr, sizeof(payloadStr), "%u", moonlightFeatureFlags);
         err |= addAttributeString(&optionHead, "x-ml-general.featureFlags", payloadStr);
+
+        // Advertise multi-stream count if negotiated
+        if (MultiStreamSupported && StreamConfig.multiStreamCount > 1) {
+            snprintf(payloadStr, sizeof(payloadStr), "%d", StreamConfig.multiStreamCount);
+            err |= addAttributeString(&optionHead, "x-ml-general.multiStreamCount", payloadStr);
+        }
 
         // New-style control stream encryption is low overhead, so we enable it any time it is supported
         if (EncryptionFeaturesSupported & SS_ENC_CONTROL_V2) {

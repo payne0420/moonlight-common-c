@@ -53,6 +53,12 @@ extern uint32_t EncryptionFeaturesSupported;
 extern uint32_t EncryptionFeaturesRequested;
 extern uint32_t EncryptionFeaturesEnabled;
 
+// Multi-stream globals
+extern bool MultiStreamSupported;
+extern int MultiStreamCount;
+extern uint16_t AdditionalVideoPortNumbers[3];
+extern SS_PING AdditionalVideoPingPayloads[3];
+
 // ENet channel ID values
 #define CTRL_CHANNEL_GENERIC      0x00
 #define CTRL_CHANNEL_URGENT       0x01 // IDR, LTR ACK and RFI
@@ -87,6 +93,7 @@ extern uint32_t EncryptionFeaturesEnabled;
 // Client feature flags for x-ml-general.featureFlags SDP attribute
 #define ML_FF_FEC_STATUS 0x01 // Client sends SS_FRAME_FEC_STATUS for frame losses
 #define ML_FF_SESSION_ID_V1 0x02 // Client supports X-SS-Ping-Payload and X-SS-Connect-Data
+#define ML_FF_MULTI_STREAM 0x04 // Client supports multiple independent video streams
 
 #define UDP_RECV_POLL_TIMEOUT_MS 100
 
