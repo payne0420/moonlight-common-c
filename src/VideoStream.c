@@ -42,14 +42,32 @@ typedef struct _VIDEO_STREAM_STATE {
 static VIDEO_STREAM_STATE videoStreams[MAX_VIDEO_STREAMS];
 static int numActiveVideoStreams;
 
+// Counts of threads actually started, so teardown only interrupts/joins real threads.
+// Joining a never-created PLT_THREAD (e.g. after a partial startup failure), or joining
+// the same one twice, is undefined behavior.
+static int numStartedReceiveThreads;
+static int numStartedPingThreads;
+static int numStartedDecoderThreads;
+
 // Initialize the video stream(s)
 void initializeVideoStream(void) {
     numActiveVideoStreams = NumVideoStreams;
+    numStartedReceiveThreads = 0;
+    numStartedPingThreads = 0;
+    numStartedDecoderThreads = 0;
+
+    // Initialize a depacketizer (and its decode unit queue) for every possible
+    // stream, not just the active ones. A client may create more decoders than the
+    // host negotiated (e.g. it requested multi-stream but the host fell back to
+    // single-stream); those decoders then block harmlessly on an empty queue
+    // instead of touching an uninitialized one.
+    for (int i = 0; i < MAX_VIDEO_STREAMS; i++) {
+        initializeVideoDepacketizer(i, StreamConfig.packetSize);
+    }
 
     for (int i = 0; i < numActiveVideoStreams; i++) {
         VIDEO_STREAM_STATE* state = &videoStreams[i];
 
-        initializeVideoDepacketizer(i, StreamConfig.packetSize);
         RtpvInitializeQueue(&state->rtpQueue);
         state->rtpQueue.streamIndex = i;
         state->decryptionCtx = PltCreateCryptoContext();
@@ -71,7 +89,8 @@ void destroyVideoStream(void) {
         RtpvCleanupQueue(&state->rtpQueue);
     }
 
-    for (int i = 0; i < numActiveVideoStreams; i++) {
+    // Destroy every depacketizer we initialized (one per possible stream).
+    for (int i = 0; i < MAX_VIDEO_STREAMS; i++) {
         destroyVideoDepacketizer(i);
     }
 }
@@ -259,11 +278,13 @@ static void VideoReceiveThreadProc(void* context) {
     }
 }
 
-void notifyKeyFrameReceived(void) {
-    // Remember that we got a full frame successfully on stream 0
-    // For multi-stream, this is called from the depacketizer which
-    // currently operates on the primary stream's queue
-    videoStreams[0].receivedFullFrame = true;
+void notifyKeyFrameReceived(int streamIndex) {
+    // Remember that we got a full frame successfully on this stream
+    if (streamIndex < 0 || streamIndex >= MAX_VIDEO_STREAMS) {
+        LC_ASSERT(false);
+        return;
+    }
+    videoStreams[streamIndex].receivedFullFrame = true;
 }
 
 // Decoder thread proc (used for non-direct-submit decoders)
@@ -274,7 +295,7 @@ static void VideoDecoderThreadProc(void* context) {
         VIDEO_FRAME_HANDLE frameHandle;
         PDECODE_UNIT decodeUnit;
 
-        if (!LiWaitForNextVideoFrame(&frameHandle, &decodeUnit)) {
+        if (!LiWaitForNextVideoFrameForStream(state->streamIndex, &frameHandle, &decodeUnit)) {
             return;
         }
 
@@ -310,35 +331,48 @@ void stopVideoStream(void) {
 
     VideoCallbacks.stop();
 
-    // Wake up client code that may be waiting on the decode unit queue
-    for (int i = 0; i < numActiveVideoStreams; i++) {
+    // Wake up client code that may be waiting on a decode unit queue. Signal every
+    // possible stream (not just the active ones): a client may have created a
+    // decoder for a stream the host never sent, and its pull thread is blocked on
+    // that stream's empty queue waiting for shutdown.
+    for (int i = 0; i < MAX_VIDEO_STREAMS; i++) {
         stopVideoDepacketizer(i);
     }
 
-    // Interrupt all threads for all streams
+    // Interrupt threads that were actually started. Interrupt every thread before joining
+    // any of them so a thread blocked on another isn't deadlocked during teardown.
+    for (int i = 0; i < numStartedPingThreads; i++) {
+        PltInterruptThread(&videoStreams[i].udpPingThread);
+    }
+    for (int i = 0; i < numStartedReceiveThreads; i++) {
+        PltInterruptThread(&videoStreams[i].receiveThread);
+    }
+    for (int i = 0; i < numStartedDecoderThreads; i++) {
+        PltInterruptThread(&videoStreams[i].decoderThread);
+    }
     for (int i = 0; i < numActiveVideoStreams; i++) {
-        VIDEO_STREAM_STATE* state = &videoStreams[i];
-
-        PltInterruptThread(&state->udpPingThread);
-        PltInterruptThread(&state->receiveThread);
-        if ((VideoCallbacks.capabilities & (CAPABILITY_DIRECT_SUBMIT | CAPABILITY_PULL_RENDERER)) == 0) {
-            PltInterruptThread(&state->decoderThread);
-        }
-
-        if (state->firstFrameSocket != INVALID_SOCKET) {
-            shutdownTcpSocket(state->firstFrameSocket);
+        if (videoStreams[i].firstFrameSocket != INVALID_SOCKET) {
+            shutdownTcpSocket(videoStreams[i].firstFrameSocket);
         }
     }
 
-    // Join all threads for all streams
+    // Join threads that were actually started
+    for (int i = 0; i < numStartedPingThreads; i++) {
+        PltJoinThread(&videoStreams[i].udpPingThread);
+    }
+    for (int i = 0; i < numStartedReceiveThreads; i++) {
+        PltJoinThread(&videoStreams[i].receiveThread);
+    }
+    for (int i = 0; i < numStartedDecoderThreads; i++) {
+        PltJoinThread(&videoStreams[i].decoderThread);
+    }
+    numStartedPingThreads = 0;
+    numStartedReceiveThreads = 0;
+    numStartedDecoderThreads = 0;
+
+    // Close sockets for all streams
     for (int i = 0; i < numActiveVideoStreams; i++) {
         VIDEO_STREAM_STATE* state = &videoStreams[i];
-
-        PltJoinThread(&state->udpPingThread);
-        PltJoinThread(&state->receiveThread);
-        if ((VideoCallbacks.capabilities & (CAPABILITY_DIRECT_SUBMIT | CAPABILITY_PULL_RENDERER)) == 0) {
-            PltJoinThread(&state->decoderThread);
-        }
 
         if (state->firstFrameSocket != INVALID_SOCKET) {
             closeSocket(state->firstFrameSocket);
@@ -396,35 +430,28 @@ int startVideoStream(void* rendererContext, int drFlags) {
         snprintf(threadName, sizeof(threadName), "VideoRecv%d", i);
         err = PltCreateThread(threadName, VideoReceiveThreadProc, state, &state->receiveThread);
         if (err != 0) {
-            // Interrupt and join previously started receive threads
-            for (int j = 0; j < i; j++) {
-                PltInterruptThread(&videoStreams[j].receiveThread);
-                PltJoinThread(&videoStreams[j].receiveThread);
-            }
-            VideoCallbacks.stop();
-            for (int j = 0; j < numActiveVideoStreams; j++) {
-                closeSocket(videoStreams[j].rtpSocket);
-                videoStreams[j].rtpSocket = INVALID_SOCKET;
-            }
-            VideoCallbacks.cleanup();
+            // stopVideoStream() tears down exactly the threads/sockets started so far
+            stopVideoStream();
             return err;
         }
+        numStartedReceiveThreads++;
     }
 
-    // Start decoder threads for non-direct-submit decoders (stream 0 only for now)
+    // Start a decoder thread per stream for non-direct-submit / non-pull decoders.
+    // Direct-submit decoders are fed inline from reassembleFrame(); pull decoders
+    // drain the per-stream queues themselves via LiWaitForNextVideoFrameForStream().
     if ((VideoCallbacks.capabilities & (CAPABILITY_DIRECT_SUBMIT | CAPABILITY_PULL_RENDERER)) == 0) {
-        VIDEO_STREAM_STATE* state = &videoStreams[0];
-        err = PltCreateThread("VideoDec", VideoDecoderThreadProc, state, &state->decoderThread);
-        if (err != 0) {
-            VideoCallbacks.stop();
-            for (int j = 0; j < numActiveVideoStreams; j++) {
-                PltInterruptThread(&videoStreams[j].receiveThread);
-                PltJoinThread(&videoStreams[j].receiveThread);
-                closeSocket(videoStreams[j].rtpSocket);
-                videoStreams[j].rtpSocket = INVALID_SOCKET;
+        for (int i = 0; i < numActiveVideoStreams; i++) {
+            VIDEO_STREAM_STATE* state = &videoStreams[i];
+            char threadName[32];
+
+            snprintf(threadName, sizeof(threadName), "VideoDec%d", i);
+            err = PltCreateThread(threadName, VideoDecoderThreadProc, state, &state->decoderThread);
+            if (err != 0) {
+                stopVideoStream();
+                return err;
             }
-            VideoCallbacks.cleanup();
-            return err;
+            numStartedDecoderThreads++;
         }
     }
 
@@ -447,14 +474,10 @@ int startVideoStream(void* rendererContext, int drFlags) {
         snprintf(threadName, sizeof(threadName), "VideoPing%d", i);
         err = PltCreateThread(threadName, VideoPingThreadProc, state, &state->udpPingThread);
         if (err != 0) {
-            // Interrupt and join previously started ping threads
-            for (int j = 0; j < i; j++) {
-                PltInterruptThread(&videoStreams[j].udpPingThread);
-                PltJoinThread(&videoStreams[j].udpPingThread);
-            }
             stopVideoStream();
             return err;
         }
+        numStartedPingThreads++;
     }
 
     // Gen 3 first frame read (stream 0 only)

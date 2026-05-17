@@ -99,7 +99,9 @@ static PLT_THREAD requestIdrFrameThread;
 static PLT_THREAD controlReceiveThread;
 static PLT_THREAD asyncCallbackThread;
 static uint32_t lastGoodFrame;
-static uint32_t lastSeenFrame;
+// Per-stream: each video stream has independent frame numbering, so a single
+// global counter cannot track them (it would assert or compute bogus loss).
+static uint32_t lastSeenFrame[MAX_VIDEO_STREAMS];
 static bool stopping;
 static bool disconnectPending;
 static bool encryptedControlStream;
@@ -342,7 +344,10 @@ int initializeControlStream(void) {
     }
 
     lastGoodFrame = 0;
-    lastSeenFrame = 0;
+    for (int i = 0; i < MAX_VIDEO_STREAMS; i++) {
+        lastSeenFrame[i] = 0;
+    }
+    firstFrameTimeMs = 0;
     disconnectPending = false;
     intervalGoodFrameCount = 0;
     intervalTotalFrameCount = 0;
@@ -443,8 +448,16 @@ void connectionDetectedFrameLoss(uint32_t startFrame, uint32_t endFrame) {
 
 // When we receive a frame, update the number of our current frame
 // and send ACK control message if the frame is LTR
-void connectionReceivedCompleteFrame(uint32_t frameIndex, bool frameIsLTR) {
-    lastGoodFrame = frameIndex;
+void connectionReceivedCompleteFrame(int streamIndex, uint32_t frameIndex, bool frameIsLTR) {
+    // lastGoodFrame feeds the connection-wide loss-stats message; track it from the
+    // primary stream so other streams' independent numbering doesn't clobber it.
+    if (streamIndex == 0) {
+        lastGoodFrame = frameIndex;
+    }
+
+    // intervalGoodFrameCount aggregates received frames across all streams. It is
+    // paired with intervalTotalFrameCount (also summed across all streams in
+    // connectionSawFrame), so the loss-rate ratio stays valid.
     intervalGoodFrameCount++;
 
     if (frameIsLTR && IS_SUNSHINE() && isReferenceFrameInvalidationEnabled()) {
@@ -483,20 +496,29 @@ void connectionSendFrameFecStatus(PSS_FRAME_FEC_STATUS fecStatus) {
     }
 }
 
-void connectionSawFrame(uint32_t frameIndex) {
-    LC_ASSERT_VT(!isBefore16(frameIndex, lastSeenFrame));
+void connectionSawFrame(int streamIndex, uint32_t frameIndex) {
+    if (streamIndex < 0 || streamIndex >= MAX_VIDEO_STREAMS) {
+        LC_ASSERT(false);
+        return;
+    }
+
+    // Each stream has independent frame numbering, so lastSeenFrame is per-stream.
+    LC_ASSERT_VT(!isBefore16(frameIndex, lastSeenFrame[streamIndex]));
 
     uint64_t now = PltGetMillis();
 
     // Suppress connection status warnings for the first sampling period
     // to allow the network and host to settle.
-    if (lastSeenFrame == 0) {
-        lastSeenFrame = frameIndex;
-        firstFrameTimeMs = now;
+    if (lastSeenFrame[streamIndex] == 0) {
+        lastSeenFrame[streamIndex] = frameIndex;
+        // firstFrameTimeMs marks the first frame seen on any stream
+        if (firstFrameTimeMs == 0) {
+            firstFrameTimeMs = now;
+        }
         return;
     }
     else if (now - firstFrameTimeMs < CONN_STATUS_SAMPLE_PERIOD) {
-        lastSeenFrame = frameIndex;
+        lastSeenFrame[streamIndex] = frameIndex;
         return;
     }
 
@@ -525,8 +547,8 @@ void connectionSawFrame(uint32_t frameIndex) {
         intervalGoodFrameCount = intervalTotalFrameCount = 0;
     }
 
-    intervalTotalFrameCount += frameIndex - lastSeenFrame;
-    lastSeenFrame = frameIndex;
+    intervalTotalFrameCount += frameIndex - lastSeenFrame[streamIndex];
+    lastSeenFrame[streamIndex] = frameIndex;
 }
 
 // Reads an NV control stream packet from the TCP connection
@@ -1333,7 +1355,7 @@ static void controlReceiveThreadFunc(void* context) {
                         terminationErrorCode = ML_ERROR_PROTECTED_CONTENT;
                         break;
                     case 0x80030023: // NVST_DISCONN_SERVER_TERMINATED_CLOSED
-                        if (lastSeenFrame != 0) {
+                        if (lastSeenFrame[0] != 0) {
                             // Pass error code 0 to notify the client that this was not an error
                             terminationErrorCode = ML_ERROR_GRACEFUL_TERMINATION;
                         }
@@ -1358,7 +1380,7 @@ static void controlReceiveThreadFunc(void* context) {
 
                     // SERVER_TERMINATED_INTENDED
                     if (terminationReason == 0x0100) {
-                        if (lastSeenFrame != 0) {
+                        if (lastSeenFrame[0] != 0) {
                             // Pass error code 0 to notify the client that this was not an error
                             terminationErrorCode = ML_ERROR_GRACEFUL_TERMINATION;
                         }

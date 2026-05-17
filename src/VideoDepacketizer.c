@@ -40,6 +40,17 @@ typedef struct _VIDEO_DEPACKETIZER_CTX {
 
 static VIDEO_DEPACKETIZER_CTX depacketizers[MAX_VIDEO_STREAMS];
 
+// Validates a stream index before it is used to index depacketizers[]. An out-of-range
+// value means memory corruption or a malformed/hostile value reached us, so we assert in
+// debug builds and fail safe in release builds rather than reading or writing out of bounds.
+static bool isValidStreamIndex(int streamIndex) {
+    if (streamIndex < 0 || streamIndex >= MAX_VIDEO_STREAMS) {
+        LC_ASSERT(false);
+        return false;
+    }
+    return true;
+}
+
 typedef struct _BUFFER_DESC {
     char* data;
     unsigned int offset;
@@ -68,16 +79,18 @@ typedef struct _LENTRY_INTERNAL {
 
 // Init
 void initializeVideoDepacketizer(int streamIndex, int pktSize) {
-    VIDEO_DEPACKETIZER_CTX* ctx = &depacketizers[streamIndex];
+    VIDEO_DEPACKETIZER_CTX* ctx;
 
-    // Only initialize the decode unit queue for stream 0. All streams push to
-    // depacketizers[0].decodeUnitQueue, so the queue (and its mutex/condvar)
-    // should only be created and destroyed once. Without this guard, streams 1+
-    // create queues that are never destroyed, leaking mutexes and triggering
-    // the LC_ASSERT(activeMutexes == 0) assertion in cleanupPlatform().
-    if (streamIndex == 0) {
-        LbqInitializeLinkedBlockingQueue(&ctx->decodeUnitQueue, 15);
+    if (!isValidStreamIndex(streamIndex)) {
+        return;
     }
+    ctx = &depacketizers[streamIndex];
+
+    // Each stream owns its own decode unit queue, so its frames are delivered only
+    // to the decoder bound to that stream's monitor. initializeVideoDepacketizer()
+    // and destroyVideoDepacketizer() are both called exactly once per stream, so the
+    // queue's mutex/condvar are created and destroyed in balanced pairs.
+    LbqInitializeLinkedBlockingQueue(&ctx->decodeUnitQueue, 15);
 
     ctx->nextFrameNumber = 1;
     ctx->startFrameNumber = 0;
@@ -167,19 +180,24 @@ static void freeDecodeUnitList(PLINKED_BLOCKING_QUEUE_ENTRY entry) {
 }
 
 void stopVideoDepacketizer(int streamIndex) {
-    // All streams share the decode unit queue on depacketizers[0],
-    // so only signal shutdown on stream 0.
-    LbqSignalQueueShutdown(&depacketizers[0].decodeUnitQueue);
+    if (!isValidStreamIndex(streamIndex)) {
+        return;
+    }
+    // Wake any consumer blocked in LiWaitForNextVideoFrameForStream() on this stream.
+    LbqSignalQueueShutdown(&depacketizers[streamIndex].decodeUnitQueue);
 }
 
 // Cleanup video depacketizer and free malloced memory
 void destroyVideoDepacketizer(int streamIndex) {
-    VIDEO_DEPACKETIZER_CTX* ctx = &depacketizers[streamIndex];
+    VIDEO_DEPACKETIZER_CTX* ctx;
 
-    // Only destroy the shared decode unit queue when destroying stream 0
-    if (streamIndex == 0) {
-        freeDecodeUnitList(LbqDestroyLinkedBlockingQueue(&ctx->decodeUnitQueue));
+    if (!isValidStreamIndex(streamIndex)) {
+        return;
     }
+    ctx = &depacketizers[streamIndex];
+
+    // Destroy this stream's own decode unit queue
+    freeDecodeUnitList(LbqDestroyLinkedBlockingQueue(&ctx->decodeUnitQueue));
 
     cleanupFrameState(ctx);
 }
@@ -263,15 +281,46 @@ static void validateDecodeUnitForPlayback(VIDEO_DEPACKETIZER_CTX* ctx, PDECODE_U
     }
 }
 
-bool LiWaitForNextVideoFrame(VIDEO_FRAME_HANDLE* frameHandle, PDECODE_UNIT* decodeUnit) {
+bool LiWaitForNextVideoFrameForStream(int streamIndex, VIDEO_FRAME_HANDLE* frameHandle, PDECODE_UNIT* decodeUnit) {
     PQUEUED_DECODE_UNIT qdu;
 
-    int err = LbqWaitForQueueElement(&depacketizers[0].decodeUnitQueue, (void**)&qdu);
+    if (!isValidStreamIndex(streamIndex)) {
+        return false;
+    }
+
+    int err = LbqWaitForQueueElement(&depacketizers[streamIndex].decodeUnitQueue, (void**)&qdu);
     if (err != LBQ_SUCCESS) {
         return false;
     }
 
-    validateDecodeUnitForPlayback(&depacketizers[qdu->decodeUnit.streamIndex], &qdu->decodeUnit);
+    if (isValidStreamIndex(qdu->decodeUnit.streamIndex)) {
+        validateDecodeUnitForPlayback(&depacketizers[qdu->decodeUnit.streamIndex], &qdu->decodeUnit);
+    }
+
+    *frameHandle = qdu;
+    *decodeUnit = &qdu->decodeUnit;
+    return true;
+}
+
+bool LiWaitForNextVideoFrame(VIDEO_FRAME_HANDLE* frameHandle, PDECODE_UNIT* decodeUnit) {
+    return LiWaitForNextVideoFrameForStream(0, frameHandle, decodeUnit);
+}
+
+bool LiPollNextVideoFrameForStream(int streamIndex, VIDEO_FRAME_HANDLE* frameHandle, PDECODE_UNIT* decodeUnit) {
+    PQUEUED_DECODE_UNIT qdu;
+
+    if (!isValidStreamIndex(streamIndex)) {
+        return false;
+    }
+
+    int err = LbqPollQueueElement(&depacketizers[streamIndex].decodeUnitQueue, (void**)&qdu);
+    if (err != LBQ_SUCCESS) {
+        return false;
+    }
+
+    if (isValidStreamIndex(qdu->decodeUnit.streamIndex)) {
+        validateDecodeUnitForPlayback(&depacketizers[qdu->decodeUnit.streamIndex], &qdu->decodeUnit);
+    }
 
     *frameHandle = qdu;
     *decodeUnit = &qdu->decodeUnit;
@@ -279,49 +328,56 @@ bool LiWaitForNextVideoFrame(VIDEO_FRAME_HANDLE* frameHandle, PDECODE_UNIT* deco
 }
 
 bool LiPollNextVideoFrame(VIDEO_FRAME_HANDLE* frameHandle, PDECODE_UNIT* decodeUnit) {
+    return LiPollNextVideoFrameForStream(0, frameHandle, decodeUnit);
+}
+
+bool LiPeekNextVideoFrameForStream(int streamIndex, PDECODE_UNIT* decodeUnit) {
     PQUEUED_DECODE_UNIT qdu;
 
-    int err = LbqPollQueueElement(&depacketizers[0].decodeUnitQueue, (void**)&qdu);
+    if (!isValidStreamIndex(streamIndex)) {
+        return false;
+    }
+
+    int err = LbqPeekQueueElement(&depacketizers[streamIndex].decodeUnitQueue, (void**)&qdu);
     if (err != LBQ_SUCCESS) {
         return false;
     }
 
-    validateDecodeUnitForPlayback(&depacketizers[qdu->decodeUnit.streamIndex], &qdu->decodeUnit);
+    if (isValidStreamIndex(qdu->decodeUnit.streamIndex)) {
+        validateDecodeUnitForPlayback(&depacketizers[qdu->decodeUnit.streamIndex], &qdu->decodeUnit);
+    }
 
-    *frameHandle = qdu;
     *decodeUnit = &qdu->decodeUnit;
     return true;
 }
 
 bool LiPeekNextVideoFrame(PDECODE_UNIT* decodeUnit) {
-    PQUEUED_DECODE_UNIT qdu;
+    return LiPeekNextVideoFrameForStream(0, decodeUnit);
+}
 
-    int err = LbqPeekQueueElement(&depacketizers[0].decodeUnitQueue, (void**)&qdu);
-    if (err != LBQ_SUCCESS) {
-        return false;
+void LiWakeWaitForVideoFrameForStream(int streamIndex) {
+    if (!isValidStreamIndex(streamIndex)) {
+        return;
     }
-
-    validateDecodeUnitForPlayback(&depacketizers[qdu->decodeUnit.streamIndex], &qdu->decodeUnit);
-
-    *decodeUnit = &qdu->decodeUnit;
-    return true;
+    LbqSignalQueueUserWake(&depacketizers[streamIndex].decodeUnitQueue);
 }
 
 void LiWakeWaitForVideoFrame(void) {
-    LbqSignalQueueUserWake(&depacketizers[0].decodeUnitQueue);
+    LiWakeWaitForVideoFrameForStream(0);
 }
 
 // Cleanup a decode unit by freeing the buffer chain and the holder
 void LiCompleteVideoFrame(VIDEO_FRAME_HANDLE handle, int drStatus) {
     PQUEUED_DECODE_UNIT qdu = handle;
     PLENTRY_INTERNAL lastEntry;
-    VIDEO_DEPACKETIZER_CTX* ctx = &depacketizers[qdu->decodeUnit.streamIndex];
+    VIDEO_DEPACKETIZER_CTX* ctx = isValidStreamIndex(qdu->decodeUnit.streamIndex) ?
+        &depacketizers[qdu->decodeUnit.streamIndex] : NULL;
 
-    if (drStatus == DR_NEED_IDR) {
+    if (ctx != NULL && drStatus == DR_NEED_IDR) {
         Limelog("Requesting IDR frame on behalf of DR\n");
         requestDecoderRefresh(ctx->streamIndex);
     }
-    else if (drStatus == DR_OK && qdu->decodeUnit.frameType == FRAME_TYPE_IDR) {
+    else if (ctx != NULL && drStatus == DR_OK && qdu->decodeUnit.frameType == FRAME_TYPE_IDR) {
         // Remember that the IDR frame was processed. We can now use
         // reference frame invalidation.
         ctx->idrFrameProcessed = true;
@@ -532,7 +588,7 @@ static void reassembleFrame(VIDEO_DEPACKETIZER_CTX* ctx, int frameNumber, bool f
             // Invoke the key frame callback if needed
             if (ctx->nalChainHead->bufferType != BUFFER_TYPE_PICDATA || qdu->decodeUnit.frameType == FRAME_TYPE_IDR) {
                 qdu->decodeUnit.frameType = FRAME_TYPE_IDR;
-                notifyKeyFrameReceived();
+                notifyKeyFrameReceived(ctx->streamIndex);
             }
             else {
                 qdu->decodeUnit.frameType = FRAME_TYPE_PFRAME;
@@ -542,9 +598,10 @@ static void reassembleFrame(VIDEO_DEPACKETIZER_CTX* ctx, int frameNumber, bool f
             ctx->nalChainDataLength = 0;
 
             if ((VideoCallbacks.capabilities & CAPABILITY_DIRECT_SUBMIT) == 0) {
-                // All streams push to the shared decode unit queue on depacketizers[0]
-                if (LbqOfferQueueItem(&depacketizers[0].decodeUnitQueue, qdu, &qdu->entry) == LBQ_BOUND_EXCEEDED) {
-                    Limelog("Video decode unit queue overflow\n");
+                // Each stream pushes to its own decode unit queue so the frame reaches
+                // the decoder bound to that stream's monitor.
+                if (LbqOfferQueueItem(&depacketizers[ctx->streamIndex].decodeUnitQueue, qdu, &qdu->entry) == LBQ_BOUND_EXCEEDED) {
+                    Limelog("Video decode unit queue overflow (stream %d)\n", ctx->streamIndex);
 
                     // RFI recovery is not supported here
                     ctx->waitingForIdrFrame = true;
@@ -557,11 +614,11 @@ static void reassembleFrame(VIDEO_DEPACKETIZER_CTX* ctx, int frameNumber, bool f
                     // Free the DU we were going to queue
                     free(qdu);
 
-                    // Free all frames in the decode unit queue
-                    freeDecodeUnitList(LbqFlushQueueItems(&depacketizers[0].decodeUnitQueue));
+                    // Free all frames in this stream's decode unit queue
+                    freeDecodeUnitList(LbqFlushQueueItems(&depacketizers[ctx->streamIndex].decodeUnitQueue));
 
-                    // Request an IDR frame to recover
-                    LiRequestIdrFrame();
+                    // Request an IDR frame to recover this stream
+                    LiRequestIdrFrameForStream((uint8_t) ctx->streamIndex);
                     return;
                 }
             }
@@ -572,7 +629,7 @@ static void reassembleFrame(VIDEO_DEPACKETIZER_CTX* ctx, int frameNumber, bool f
             }
 
             // Notify the control connection
-            connectionReceivedCompleteFrame(frameNumber, frameIsLTR);
+            connectionReceivedCompleteFrame(ctx->streamIndex, frameNumber, frameIsLTR);
 
             // Clear frame drops
             ctx->consecutiveFrameDrops = 0;
@@ -748,13 +805,18 @@ static void processAvcHevcRtpPayloadSlow(VIDEO_DEPACKETIZER_CTX* ctx, PBUFFER_DE
 // Dumps the decode unit queue and ensures the next frame submitted to the decoder will be
 // an IDR frame
 void requestDecoderRefresh(int streamIndex) {
-    VIDEO_DEPACKETIZER_CTX* ctx = &depacketizers[streamIndex];
+    VIDEO_DEPACKETIZER_CTX* ctx;
+
+    if (!isValidStreamIndex(streamIndex)) {
+        return;
+    }
+    ctx = &depacketizers[streamIndex];
 
     // Wait for the next IDR frame
     ctx->waitingForIdrFrame = true;
 
-    // Flush the shared decode unit queue
-    freeDecodeUnitList(LbqFlushQueueItems(&depacketizers[0].decodeUnitQueue));
+    // Flush this stream's decode unit queue
+    freeDecodeUnitList(LbqFlushQueueItems(&ctx->decodeUnitQueue));
 
     // Request the receive thread drop its state
     // on the next call. We can't do it here because
@@ -1165,7 +1227,12 @@ static void processRtpPayload(VIDEO_DEPACKETIZER_CTX* ctx, PNV_VIDEO_PACKET vide
 // avoid having to wait until the next received frame to determine
 // that we lost a frame and submit an RFI request.
 void notifyFrameLost(int streamIndex, unsigned int frameNumber, bool speculative) {
-    VIDEO_DEPACKETIZER_CTX* ctx = &depacketizers[streamIndex];
+    VIDEO_DEPACKETIZER_CTX* ctx;
+
+    if (!isValidStreamIndex(streamIndex)) {
+        return;
+    }
+    ctx = &depacketizers[streamIndex];
 
     // We may not invalidate frames that we've already received
     LC_ASSERT(frameNumber >= ctx->startFrameNumber);
@@ -1194,9 +1261,14 @@ void notifyFrameLost(int streamIndex, unsigned int frameNumber, bool speculative
 
 // Add an RTP Packet to the queue
 void queueRtpPacket(int streamIndex, PRTPV_QUEUE_ENTRY queueEntryPtr) {
-    VIDEO_DEPACKETIZER_CTX* ctx = &depacketizers[streamIndex];
+    VIDEO_DEPACKETIZER_CTX* ctx;
     int dataOffset;
     RTPV_QUEUE_ENTRY queueEntry = *queueEntryPtr;
+
+    if (!isValidStreamIndex(streamIndex)) {
+        return;
+    }
+    ctx = &depacketizers[streamIndex];
 
     LC_ASSERT(!queueEntry.isParity);
     LC_ASSERT(queueEntry.receiveTimeUs != 0);
@@ -1229,6 +1301,13 @@ void queueRtpPacket(int streamIndex, PRTPV_QUEUE_ENTRY queueEntryPtr) {
     }
 }
 
+int LiGetPendingVideoFramesForStream(int streamIndex) {
+    if (!isValidStreamIndex(streamIndex)) {
+        return 0;
+    }
+    return LbqGetItemCount(&depacketizers[streamIndex].decodeUnitQueue);
+}
+
 int LiGetPendingVideoFrames(void) {
-    return LbqGetItemCount(&depacketizers[0].decodeUnitQueue);
+    return LiGetPendingVideoFramesForStream(0);
 }

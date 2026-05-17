@@ -1157,6 +1157,16 @@ int performRtspHandshake(PSERVER_INFORMATION serverInfo) {
             } else {
                 MultiStreamSupported = false;
             }
+
+            // Fall back to a single video stream if the host does not support
+            // multi-stream. We do this here -- before the SDP is generated and the
+            // SETUP requests are issued -- so the advertised stream count, the SETUP
+            // loop, and VideoStream all agree. Otherwise we would ask a stock host
+            // for streams it cannot provide and the connection would fail outright.
+            if (!MultiStreamSupported && NumVideoStreams > 1) {
+                Limelog("Host does not support multi-stream; falling back to single-stream\n");
+                NumVideoStreams = 1;
+            }
         }
 
         // Look for the Sunshine encryption flags in the SDP attributes
@@ -1257,30 +1267,40 @@ int performRtspHandshake(PSERVER_INFORMATION serverInfo) {
         freeMessage(&response);
     }
 
-    // SETUP video stream(s) - one per monitor in multi-stream mode
+    // SETUP video stream(s) - one per monitor in multi-stream mode. NumVideoStreams
+    // has already been clamped to 1 above if the host doesn't support multi-stream.
     for (int videoStreamIdx = 0; videoStreamIdx < NumVideoStreams; videoStreamIdx++) {
         RTSP_MESSAGE response;
         int error = -1;
         char* pingPayload;
         char streamTarget[64];
 
-        if (AppVersionQuad[0] >= 5) {
+        if (AppVersionQuad[0] >= 5 && NumVideoStreams > 1) {
             snprintf(streamTarget, sizeof(streamTarget), "streamid=video/%d/0", videoStreamIdx);
         } else {
+            // Single-stream sessions use the historical "streamid=video" target so
+            // hosts that match on that exact string are unaffected.
             snprintf(streamTarget, sizeof(streamTarget), "streamid=video");
         }
 
-        if (!setupStream(&response, streamTarget, &error)) {
-            Limelog("RTSP SETUP %s request failed: %d\n", streamTarget, error);
-            ret = error;
-            goto Exit;
-        }
+        bool setupOk = setupStream(&response, streamTarget, &error);
+        int statusCode = setupOk ? response.message.response.statusCode : error;
 
-        if (response.message.response.statusCode != 200) {
-            Limelog("RTSP SETUP %s request failed: %d\n",
-                streamTarget, response.message.response.statusCode);
-            ret = response.message.response.statusCode;
-            goto Exit;
+        if (!setupOk || statusCode != 200) {
+            Limelog("RTSP SETUP %s request failed: %d\n", streamTarget, statusCode);
+            if (setupOk) {
+                freeMessage(&response);
+            }
+            if (videoStreamIdx == 0) {
+                // Stream 0 is mandatory; without it there is no session.
+                ret = statusCode;
+                goto Exit;
+            }
+            // A secondary video stream failed. Degrade gracefully to the streams
+            // that did set up rather than failing the whole connection.
+            Limelog("Continuing with %d video stream(s) after SETUP failure\n", videoStreamIdx);
+            NumVideoStreams = videoStreamIdx;
+            break;
         }
 
         // Parse the Sunshine ping payload protocol extension if present
