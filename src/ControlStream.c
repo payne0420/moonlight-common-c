@@ -1531,14 +1531,16 @@ static void requestIdrFrame(void) {
     if (!supportsIdrFrameRequest) {
         int64_t payload[3];
 
-        // Form the payload
-        if (lastSeenFrame < 0x20) {
+        // Form the payload. lastSeenFrame is per-stream; this connection-wide
+        // reference-frame-invalidation request uses the primary stream's value.
+        uint32_t lastSeen = lastSeenFrame[0];
+        if (lastSeen < 0x20) {
             payload[0] = 0;
-            payload[1] = LE64(lastSeenFrame);
+            payload[1] = LE64(lastSeen);
         }
         else {
-            payload[0] = LE64(lastSeenFrame - 0x20);
-            payload[1] = LE64(lastSeenFrame);
+            payload[0] = LE64(lastSeen - 0x20);
+            payload[1] = LE64(lastSeen);
         }
 
         payload[2] = 0;
