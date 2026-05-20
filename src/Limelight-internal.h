@@ -66,6 +66,7 @@ extern bool MultiStreamSupported;
 extern int MultiStreamCount;
 extern uint16_t AdditionalVideoPortNumbers[3];
 extern SS_PING AdditionalVideoPingPayloads[3];
+extern bool PerStreamIdrSupported;
 
 // ENet channel ID values
 #define CTRL_CHANNEL_GENERIC      0x00

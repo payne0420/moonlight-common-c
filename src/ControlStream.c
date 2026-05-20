@@ -116,6 +116,16 @@ static int lastConnectionStatusUpdate;
 static uint32_t currentEnetSequenceNumber;
 static uint64_t firstFrameTimeMs;
 
+// Pending IDR requests. The IDR thread waits on idrFrameRequiredEvent and, when
+// signaled, sends either a global IDR (legacy) or a per-stream IDR for each
+// stream whose bit is set in pendingPerStreamIdrMask. A global request supersedes
+// any pending per-stream requests: with per-stream IDR a single stream emits
+// only one IDR (the original wins), but a global IDR makes every stream emit
+// one, which already covers what the per-stream requests would have done.
+static bool pendingGlobalIdrRequest;
+static uint32_t pendingPerStreamIdrMask;
+static PLT_MUTEX pendingIdrMutex;
+
 static LINKED_BLOCKING_QUEUE referenceFrameControlQueue;
 static LINKED_BLOCKING_QUEUE frameFecStatusQueue;
 static LINKED_BLOCKING_QUEUE asyncCallbackQueue;
@@ -142,6 +152,7 @@ static PPLT_CRYPTO_CONTEXT decryptionCtx;
 #define IDX_SET_MOTION_EVENT 10
 #define IDX_SET_RGB_LED 11
 #define IDX_DS_ADAPTIVE_TRIGGERS 12
+#define IDX_REQUEST_IDR_FRAME_PER_STREAM 13
 
 #define CONTROL_STREAM_TIMEOUT_SEC 10
 #define CONTROL_STREAM_LINGER_TIMEOUT_SEC 2
@@ -159,6 +170,8 @@ static const short packetTypesGen3[] = {
     -1,     // Rumble triggers (unused)
     -1,     // Set motion event (unused)
     -1,     // Set RGB LED (unused)
+    -1,     // Adaptive triggers (unused)
+    -1,     // Per-stream IDR (Sunshine-only, unused on Gen3)
 };
 static const short packetTypesGen4[] = {
     0x0606, // Request IDR frame
@@ -173,6 +186,8 @@ static const short packetTypesGen4[] = {
     -1,     // Rumble triggers (unused)
     -1,     // Set motion event (unused)
     -1,     // Set RGB LED (unused)
+    -1,     // Adaptive triggers (unused)
+    -1,     // Per-stream IDR (Sunshine-only, unused on Gen4)
 };
 static const short packetTypesGen5[] = {
     0x0305, // Start A
@@ -187,6 +202,8 @@ static const short packetTypesGen5[] = {
     -1,     // Rumble triggers (unused)
     -1,     // Set motion event (unused)
     -1,     // Set RGB LED (unused)
+    -1,     // Adaptive triggers (unused)
+    -1,     // Per-stream IDR (unused on Gen5)
 };
 static const short packetTypesGen7[] = {
     0x0305, // Start A
@@ -201,6 +218,8 @@ static const short packetTypesGen7[] = {
     -1,     // Rumble triggers (unused)
     -1,     // Set motion event (unused)
     -1,     // Set RGB LED (unused)
+    -1,     // Adaptive triggers (unused)
+    -1,     // Per-stream IDR (Sunshine-only)
 };
 static const short packetTypesGen7Enc[] = {
     0x0302, // Request IDR frame
@@ -216,6 +235,7 @@ static const short packetTypesGen7Enc[] = {
     0x5501, // Set motion event (Sunshine protocol extension)
     0x5502, // Set RGB LED (Sunshine protocol extension)
     0x5503, // Set Adaptive Triggers (Sunshine protocol extension)
+    0x5504, // Request IDR for a single stream (Sunshine protocol extension, multi-stream)
 };
 
 static const char requestIdrFrameGen3[] = { 0, 0 };
@@ -307,6 +327,9 @@ int initializeControlStream(void) {
     LbqInitializeLinkedBlockingQueue(&frameFecStatusQueue, 8); // Limits number of frame status reports per periodic ping interval
     LbqInitializeLinkedBlockingQueue(&asyncCallbackQueue, 30);
     PltCreateMutex(&enetMutex);
+    PltCreateMutex(&pendingIdrMutex);
+    pendingGlobalIdrRequest = false;
+    pendingPerStreamIdrMask = 0;
 
     encryptedControlStream = APP_VERSION_AT_LEAST(7, 1, 431);
 
@@ -386,6 +409,7 @@ void destroyControlStream(void) {
     freeBasicLbqList(LbqDestroyLinkedBlockingQueue(&asyncCallbackQueue));
 
     PltDeleteMutex(&enetMutex);
+    PltDeleteMutex(&pendingIdrMutex);
 }
 
 static void queueFrameInvalidationTuple(uint32_t startFrame, uint32_t endFrame) {
@@ -422,23 +446,38 @@ void LiRequestIdrFrame(void) {
     // We require a full IDR frame to recover.
     freeBasicLbqList(LbqFlushQueueItems(&referenceFrameControlQueue));
 
+    // Mark the pending request as global. A global IDR makes every stream emit
+    // one, which covers any per-stream requests that were also pending, so we
+    // can drop the per-stream mask here.
+    PltLockMutex(&pendingIdrMutex);
+    pendingGlobalIdrRequest = true;
+    pendingPerStreamIdrMask = 0;
+    PltUnlockMutex(&pendingIdrMutex);
+
     // Request the IDR frame
     PltSetEvent(&idrFrameRequiredEvent);
 }
 
 // Request an IDR frame for a specific video stream (multi-stream).
-// For stream 0 or non-Sunshine hosts, falls back to global IDR.
+// When the host supports per-stream IDR (PerStreamIdrSupported was advertised
+// in the SDP DESCRIBE response), the IDR thread sends a 0x5504 control message
+// targeting only that stream's encoder -- including stream 0, so a primary
+// stream loss in a multi-stream session no longer cascades into every encoder.
+// Otherwise we fall back to a global IDR, which forces every stream's encoder
+// to emit a new IDR (correct, but the original source of the IDR storm).
 void LiRequestIdrFrameForStream(uint8_t streamIndex) {
-    if (streamIndex == 0 || !IS_SUNSHINE()) {
+    if (!PerStreamIdrSupported || streamIndex >= MAX_VIDEO_STREAMS) {
         LiRequestIdrFrame();
         return;
     }
 
-    // Per-stream IDR: for now, fall back to global IDR.
-    // Full per-stream control message (0x5504) will be added when the
-    // server handler is implemented.
-    Limelog("Per-stream IDR requested for stream %d\n", streamIndex);
-    LiRequestIdrFrame();
+    PltLockMutex(&pendingIdrMutex);
+    if (!pendingGlobalIdrRequest) {
+        pendingPerStreamIdrMask |= (uint32_t) 1u << streamIndex;
+    }
+    PltUnlockMutex(&pendingIdrMutex);
+
+    PltSetEvent(&idrFrameRequiredEvent);
 }
 
 // Invalidate reference frames lost by the network
@@ -1660,6 +1699,25 @@ static void referenceFrameControlFunc(void* context) {
     }
 }
 
+// Sends a per-stream IDR frame request control message (0x5504) for the given
+// stream. Only used when the server has advertised PerStreamIdrSupported.
+static void requestPerStreamIdrFrame(uint8_t streamIndex) {
+    uint8_t payload = streamIndex;
+
+    if (!sendMessageAndDiscardReply(packetTypes[IDX_REQUEST_IDR_FRAME_PER_STREAM],
+                                    sizeof(payload),
+                                    &payload,
+                                    CTRL_CHANNEL_URGENT,
+                                    ENET_PACKET_FLAG_RELIABLE,
+                                    false)) {
+        Limelog("Request per-stream IDR Frame: Transaction failed: %d\n", (int)LastSocketError());
+        ListenerCallbacks.connectionTerminated(LastSocketFail());
+        return;
+    }
+
+    Limelog("Per-stream IDR frame request sent (stream %u)\n", (unsigned) streamIndex);
+}
+
 static void requestIdrFrameFunc(void* context) {
     while (!PltIsThreadInterrupted(&requestIdrFrameThread)) {
         PltWaitForEvent(&idrFrameRequiredEvent);
@@ -1670,11 +1728,37 @@ static void requestIdrFrameFunc(void* context) {
             return;
         }
 
-        // Any pending RFI requests and LTR frame ACK messages are now redundant
-        freeBasicLbqList(LbqFlushQueueItems(&referenceFrameControlQueue));
+        // Snapshot and clear the pending IDR requests. We do this under the lock
+        // so a concurrent LiRequestIdrFrame[ForStream]() call either contributes
+        // to this batch or signals the event for the next iteration.
+        bool wantGlobal;
+        uint32_t perStreamMask;
+        PltLockMutex(&pendingIdrMutex);
+        wantGlobal = pendingGlobalIdrRequest;
+        perStreamMask = pendingPerStreamIdrMask;
+        pendingGlobalIdrRequest = false;
+        pendingPerStreamIdrMask = 0;
+        PltUnlockMutex(&pendingIdrMutex);
 
-        // Request the IDR frame
-        requestIdrFrame();
+        if (wantGlobal) {
+            // Any pending RFI requests and LTR frame ACK messages are now redundant
+            freeBasicLbqList(LbqFlushQueueItems(&referenceFrameControlQueue));
+            requestIdrFrame();
+            // A global IDR covers anything in the per-stream mask, so drop it.
+            continue;
+        }
+
+        if (perStreamMask == 0) {
+            // Spurious wake (e.g. stop signaled this event without setting either
+            // flag); nothing to do.
+            continue;
+        }
+
+        for (int i = 0; i < MAX_VIDEO_STREAMS; i++) {
+            if (perStreamMask & ((uint32_t) 1u << i)) {
+                requestPerStreamIdrFrame((uint8_t) i);
+            }
+        }
     }
 }
 

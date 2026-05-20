@@ -1169,6 +1169,21 @@ int performRtspHandshake(PSERVER_INFORMATION serverInfo) {
             }
         }
 
+        // Check if the server supports per-stream IDR requests (0x5504). Without
+        // this, any depacketizer loss recovery falls back to a global IDR that
+        // makes every stream emit an IDR simultaneously -- a bandwidth storm.
+        {
+            unsigned int perStreamIdrSupported = 0;
+            if (parseSdpAttributeToUInt(response.payload, "x-ss-general.perStreamIdrSupported", &perStreamIdrSupported)) {
+                PerStreamIdrSupported = (perStreamIdrSupported != 0);
+                if (PerStreamIdrSupported) {
+                    Limelog("Server supports per-stream IDR requests\n");
+                }
+            } else {
+                PerStreamIdrSupported = false;
+            }
+        }
+
         // Look for the Sunshine encryption flags in the SDP attributes
         if (!parseSdpAttributeToUInt(response.payload, "x-ss-general.encryptionSupported", &EncryptionFeaturesSupported)) {
             EncryptionFeaturesSupported = 0;

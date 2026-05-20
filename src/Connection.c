@@ -41,6 +41,7 @@ bool MultiStreamSupported;  // server advertised multi-stream capability
 int MultiStreamCount;  // negotiated number of independent video streams (0 or 1 = single-stream)
 uint16_t AdditionalVideoPortNumbers[3];  // ports for video streams 1..3
 SS_PING AdditionalVideoPingPayloads[3];  // ping payloads for video streams 1..3
+bool PerStreamIdrSupported;  // server can handle IDX_REQUEST_IDR_FRAME_PER_STREAM (0x5504)
 
 // Connection stages
 static const char* stageNames[STAGE_MAX] = {

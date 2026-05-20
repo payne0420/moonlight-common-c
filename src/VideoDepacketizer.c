@@ -157,9 +157,9 @@ static void dropFrameState(VIDEO_DEPACKETIZER_CTX* ctx) {
         // Restart the count
         ctx->consecutiveFrameDrops = 0;
 
-        // Request an IDR frame
+        // Request an IDR frame for this stream only
         ctx->waitingForIdrFrame = true;
-        LiRequestIdrFrame();
+        LiRequestIdrFrameForStream((uint8_t) ctx->streamIndex);
     }
 
     cleanupFrameState(ctx);
@@ -824,8 +824,10 @@ void requestDecoderRefresh(int streamIndex) {
     // the state out from under it.
     ctx->dropStatePending = true;
 
-    // Request the IDR frame
-    LiRequestIdrFrame();
+    // Request the IDR frame -- per-stream when possible so that one stream's
+    // loss doesn't force every encoder to re-emit a key frame at the same
+    // instant (multi-stream IDR storm).
+    LiRequestIdrFrameForStream((uint8_t) streamIndex);
 }
 
 // Return 1 if packet is the first one in the frame
@@ -886,7 +888,7 @@ static void processRtpPayload(VIDEO_DEPACKETIZER_CTX* ctx, PNV_VIDEO_PACKET vide
         ctx->nextFrameNumber = frameIndex + 1;
         dropFrameState(ctx);
         if (ctx->waitingForIdrFrame) {
-            LiRequestIdrFrame();
+            LiRequestIdrFrameForStream((uint8_t) ctx->streamIndex);
         }
         else {
             connectionDetectedFrameLoss(ctx->startFrameNumber, frameIndex);
@@ -1151,7 +1153,7 @@ static void processRtpPayload(VIDEO_DEPACKETIZER_CTX* ctx, PNV_VIDEO_PACKET vide
                 ctx->nextFrameNumber = frameIndex + 1;
                 dropFrameState(ctx);
                 if (ctx->waitingForIdrFrame) {
-                    LiRequestIdrFrame();
+                    LiRequestIdrFrameForStream((uint8_t) ctx->streamIndex);
                 }
                 else {
                     connectionDetectedFrameLoss(ctx->startFrameNumber, frameIndex);
@@ -1181,7 +1183,7 @@ static void processRtpPayload(VIDEO_DEPACKETIZER_CTX* ctx, PNV_VIDEO_PACKET vide
                 // detection of the recovery of the network. Requesting an IDR frame while
                 // the network is unstable will just contribute to congestion collapse.
                 if (ctx->waitingForNextSuccessfulFrame) {
-                    LiRequestIdrFrame();
+                    LiRequestIdrFrameForStream((uint8_t) ctx->streamIndex);
                 }
             }
             else {
