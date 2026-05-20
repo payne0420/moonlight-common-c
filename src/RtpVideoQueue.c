@@ -709,6 +709,23 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
         queue->multiFecCurrentBlockNumber = fecCurrentBlockNumber;
         queue->multiFecLastBlockNumber = (nvPacket->multiFecBlocks >> 6) & 0x3;
 
+        // Diagnostic: a multi-block frame with FEC disabled is the dangerous
+        // case the server falls into when an IDR exceeds 4*DATA_SHARDS_MAX
+        // packets. Any single dropped UDP packet on such a frame is
+        // unrecoverable and triggers an IDR loop. Log once at the first block
+        // so it correlates with the server's "capping VBV" / "Disabling FEC
+        // for oversized block" messages.
+        if (queue->fecPercentage == 0 &&
+            queue->multiFecLastBlockNumber > 0 &&
+            queue->multiFecCurrentBlockNumber == 0) {
+            Limelog("Stream %d frame %u: %u-block frame with FEC disabled "
+                    "(%u data packets/block) -- any UDP drop is unrecoverable\n",
+                    queue->streamIndex,
+                    queue->currentFrameNumber,
+                    (unsigned int)(queue->multiFecLastBlockNumber + 1),
+                    (unsigned int)queue->bufferDataPackets);
+        }
+
         queue->stats.packetCountVideo += queue->bufferDataPackets;
         queue->stats.packetCountFec += queue->bufferParityPackets;
     }
