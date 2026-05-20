@@ -36,6 +36,13 @@ typedef struct _VIDEO_DEPACKETIZER_CTX {
     LINKED_BLOCKING_QUEUE decodeUnitQueue;
 
     int streamIndex;
+
+    // Wall-clock ms of the most recent IDR request triggered by a decode
+    // unit queue overflow. Used to rate-limit those IDR requests so a
+    // sustained decoder backlog doesn't turn into an unrecoverable IDR
+    // feedback loop (every fresh IDR refills the queue, overflows again,
+    // and triggers another IDR before the previous one has been decoded).
+    uint64_t lastOverflowIdrRequestMs;
 } VIDEO_DEPACKETIZER_CTX;
 
 static VIDEO_DEPACKETIZER_CTX depacketizers[MAX_VIDEO_STREAMS];
@@ -90,7 +97,17 @@ void initializeVideoDepacketizer(int streamIndex, int pktSize) {
     // to the decoder bound to that stream's monitor. initializeVideoDepacketizer()
     // and destroyVideoDepacketizer() are both called exactly once per stream, so the
     // queue's mutex/condvar are created and destroyed in balanced pairs.
-    LbqInitializeLinkedBlockingQueue(&ctx->decodeUnitQueue, 15);
+    //
+    // Queue depth: 60 entries (was 15). At a high-framerate multi-stream session
+    // (e.g. 3x4K HEVC at 144 Hz, where the host CPU/decoder runs near capacity),
+    // a 15-entry queue corresponds to ~100 ms of buffer per stream and overflows
+    // any time the decoder slips even briefly. Each overflow used to trigger a
+    // catastrophic queue flush plus a per-stream IDR request -- and because the
+    // decoder was still saturated when the IDR arrived, the next IDR overflowed
+    // the queue too, creating an unrecoverable feedback loop. 60 entries gives
+    // ~400 ms of headroom at 144 Hz / ~1 s at 60 Hz, enough to absorb transient
+    // decoder hiccups without entering the loop.
+    LbqInitializeLinkedBlockingQueue(&ctx->decodeUnitQueue, 60);
 
     ctx->nextFrameNumber = 1;
     ctx->startFrameNumber = 0;
@@ -113,6 +130,7 @@ void initializeVideoDepacketizer(int streamIndex, int pktSize) {
     ctx->nalChainDataLength = 0;
     ctx->strictIdrFrameWait = !isReferenceFrameInvalidationEnabled();
     ctx->streamIndex = streamIndex;
+    ctx->lastOverflowIdrRequestMs = 0;
 }
 
 // Free the NAL chain
@@ -617,8 +635,23 @@ static void reassembleFrame(VIDEO_DEPACKETIZER_CTX* ctx, int frameNumber, bool f
                     // Free all frames in this stream's decode unit queue
                     freeDecodeUnitList(LbqFlushQueueItems(&depacketizers[ctx->streamIndex].decodeUnitQueue));
 
-                    // Request an IDR frame to recover this stream
-                    LiRequestIdrFrameForStream((uint8_t) ctx->streamIndex);
+                    // Rate-limit per-stream IDR requests triggered by overflow.
+                    // A sustained decoder backlog (e.g. 3x4K HEVC at 144 Hz on
+                    // an M-series Mac, where one of the video engines is
+                    // shared between two streams) overflows the queue every
+                    // few frames. Without this cooldown each overflow fires a
+                    // new IDR; the IDR arrives at a still-saturated decoder,
+                    // refills the queue, overflows again, and fires yet
+                    // another IDR -- producing an unrecoverable feedback loop
+                    // that looks to the user as "stream hangs after a few
+                    // seconds and never comes back". A 1 s cooldown lets the
+                    // most recent IDR actually reach the decoder before we
+                    // ask the server for a fresh one.
+                    uint64_t nowMs = PltGetMillis();
+                    if (nowMs - ctx->lastOverflowIdrRequestMs >= 1000) {
+                        ctx->lastOverflowIdrRequestMs = nowMs;
+                        LiRequestIdrFrameForStream((uint8_t) ctx->streamIndex);
+                    }
                     return;
                 }
             }
