@@ -120,6 +120,12 @@ bool isReferenceFrameInvalidationSupportedByDecoder(void) {
 }
 
 bool isReferenceFrameInvalidationEnabled(void) {
+    // RFI messages carry only a frame range. Multi-stream sessions have independent
+    // frame counters per stream, so recovery must use stream-indexed IDR requests.
+    if (NumVideoStreams > 1) {
+        return false;
+    }
+
     // RFI must be supported by the server and the client decoder to be used
     return ReferenceFrameInvalidationSupported && isReferenceFrameInvalidationSupportedByDecoder();
 }

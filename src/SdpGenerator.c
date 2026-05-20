@@ -474,11 +474,10 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
                 err |= addAttributeString(&optionHead, "x-nv-video[0].dynamicRangeMode", "0");
             }
 
-            // If the decoder supports reference frame invalidation, that indicates it also supports
-            // the maximum number of reference frames allowed by the codec. Even if we can't use RFI
-            // due to lack of host support, we can still allow the host to pick a number of reference
-            // frames greater than 1 to improve encoding efficiency.
-            if (isReferenceFrameInvalidationSupportedByDecoder()) {
+            // If the decoder supports reference frame invalidation and it is enabled
+            // for this stream, that indicates it also supports the maximum number of
+            // reference frames allowed by the codec.
+            if (isReferenceFrameInvalidationEnabled()) {
                 err |= addAttributeString(&optionHead, "x-nv-video[0].maxNumReferenceFrames", "0");
             }
             else {
