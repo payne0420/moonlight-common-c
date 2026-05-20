@@ -17,7 +17,13 @@
 // much kernel memory with larger packet sizes. It also
 // can smooth over transient pauses in network traffic
 // and subsequent packet/frame bursts that follow.
-#define RTP_RECV_PACKETS_BUFFERED 2048
+// Sized so each per-stream UDP recv socket can hold a full IDR worth of
+// packets plus some headroom. With a 1 KB packet size that's ~4 MB of recv
+// buffer per stream. At higher per-monitor bitrates (e.g. 100 Mbps), the
+// older 2 KB-packet * 2048-budget could fill within a single IDR if the
+// decoder thread was momentarily preempted, dropping packets at the kernel
+// boundary and triggering a per-stream IDR storm.
+#define RTP_RECV_PACKETS_BUFFERED 4096
 
 // Per-stream state for each independent video stream
 typedef struct _VIDEO_STREAM_STATE {
